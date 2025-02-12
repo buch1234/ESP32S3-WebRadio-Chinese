@@ -6,6 +6,7 @@ ESP32-aduioii2s/master by schreibfaul1 2.0.0,
 Ai_Esp32_Rotary_Encoder by igor Antolic 1,7  ,
 U8g2 bei Oliver 2.35.30 ,
 WiFiManager by tzapu 2.0.17
+time by Micael Margolis 1.6.1
 
 02.20205 in Geeste Germany
 */
