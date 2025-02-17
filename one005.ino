@@ -1,42 +1,48 @@
-#include "Arduino.h"
-#include "WiFi.h"
-#include "Audio.h"
-#include "AiEsp32RotaryEncoder.h"
-#include <U8g2lib.h>
-#include <SPI.h>
-#include <WiFiManager.h>
-#include <Preferences.h>
-#include <time.h>
+#include "Arduino.h"               // Arduino框架的基本库
+#include "WiFi.h"                  // WiFi库，用于WiFi连接
+#include "Audio.h"                 // 音频库，用于音频播放
+#include "AiEsp32RotaryEncoder.h"  // 旋转编码器库，用于旋转编码器输入
+#include <U8g2lib.h>               // 用于OLED显示屏的库
+#include <SPI.h>                   // SPI通信库
+#include <WiFiManager.h>           // WiFi管理库，简化WiFi连接过程
+#include <Preferences.h>           // 用于保存设备的配置信息
+#include <time.h>                  // 用于获取和显示当前时间
 
-#define SHOW_TIME_PERIOD 1000
-#define I2S_DOUT 39
-#define I2S_BCLK 40
-#define I2S_LRC 41
-#define VOLUME_PIN 5
+// 常量定义
+#define SHOW_TIME_PERIOD 1000  // 每秒刷新一次显示
+#define I2S_DOUT 39            // I2S数据输出引脚
+#define I2S_BCLK 40            // I2S时钟引脚
+#define I2S_LRC 41             // I2S左/右时钟引脚
+#define VOLUME_PIN 5           // 音量调节引脚
 
-#define ROTARY_ENCODER_A_PIN 16
-#define ROTARY_ENCODER_B_PIN 17
-#define ROTARY_ENCODER_BUTTON_PIN 18
-#define ROTARY_ENCODER_STEPS 4
+// 旋转编码器引脚定义
+#define ROTARY_ENCODER_A_PIN 16       // 旋转编码器A相引脚
+#define ROTARY_ENCODER_B_PIN 17       // 旋转编码器B相引脚
+#define ROTARY_ENCODER_BUTTON_PIN 18  // 旋转编码器按钮引脚
+#define ROTARY_ENCODER_STEPS 4        // 每步的旋转量
 
-enum Mode { PLAY_MODE,
-            TUNE_MODE,
-            VOLUME_MODE };
-Mode currentMode = PLAY_MODE;
-unsigned long lastInteraction = 0;
-const unsigned long modeTimeout = 3000;
+// 定义不同的工作模式
+enum Mode { PLAY_MODE,      // 播放模式
+            TUNE_MODE,      // 调谐模式
+            VOLUME_MODE };  // 音量调节模式
 
-Preferences preferences;
-U8G2_ST7565_LM6059_F_4W_SW_SPI u8g2(U8G2_R0, 11, 10, 14, 12, 13);
-AiEsp32RotaryEncoder rotaryEncoder(ROTARY_ENCODER_A_PIN, ROTARY_ENCODER_B_PIN, ROTARY_ENCODER_BUTTON_PIN, -1, ROTARY_ENCODER_STEPS);
-Audio audio;
+Mode currentMode = PLAY_MODE;            // 当前工作模式初始化为播放模式
+unsigned long lastInteraction = 0;       // 上一次交互的时间
+const unsigned long modeTimeout = 3000;  // 模式切换的超时时间
 
+Preferences preferences;                                                                                                              // 用于存储用户设置（电台、音量等）
+U8G2_ST7565_LM6059_F_4W_SW_SPI u8g2(U8G2_R0, 11, 10, 14, 12, 13);                                                                     // OLED显示屏
+AiEsp32RotaryEncoder rotaryEncoder(ROTARY_ENCODER_A_PIN, ROTARY_ENCODER_B_PIN, ROTARY_ENCODER_BUTTON_PIN, -1, ROTARY_ENCODER_STEPS);  // 旋转编码器对象
+Audio audio;                                                                                                                          // 音频对象
+
+// 电台信息结构体
 struct Station {
-  const char* url;
-  const char* name;
-  int gain;  // 电台增益
+  const char* url;   // 电台的流媒体URL
+  const char* name;  // 电台名称
+  int gain;          // 电台的增益（影响音量）
 };
 
+// 电台列表
 const Station stations[] = {
   { "http://icecast.ndr.de/ndr/njoy/live/mp3/128/stream.mp3", "n Joy", 1 },
   { "http://icecast.ndr.de/ndr/ndr2/niedersachsen/mp3/128/stream.mp3", "NDR 2", 1 },
@@ -81,25 +87,27 @@ const Station stations[] = {
   { "http://xmradio.xm.com:8000/xmfm_news.m3u", "厦门电台新闻广播", 1 },
   { "http://live.hrbfm.com:8000/hrbfm_music.m3u", "哈尔滨电台音乐广播", 1 },
   { "https://lhttp.qingting.fm/live/1223/64k.mp3", "郑州怀旧音乐", 1 },
-
 };
-const int NUM_STATIONS = sizeof(stations) / sizeof(stations[0]);
-int currentStation = 0;
-int browseIndex = 0;
-String currentSong = "未知歌曲";
-String currentArtist = "未知歌手";
 
+const int NUM_STATIONS = sizeof(stations) / sizeof(stations[0]);  // 电台数量
+int currentStation = 0;                                           // 当前电台索引
+int browseIndex = 0;                                              // 当前浏览电台的索引
+String currentSong = "未知歌曲";                                  // 当前歌曲
+String currentArtist = "未知歌手";                                // 当前歌手
+
+// 旋转编码器的中断服务程序，用于读取旋转编码器
 void IRAM_ATTR readEncoderISR() {
-  rotaryEncoder.readEncoder_ISR();
+  rotaryEncoder.readEncoder_ISR();  // 读取编码器状态
 }
 
+// 元数据回调函数，用于解析歌曲和歌手信息
 void metadataCallback(const char* type, const char* value) {
   if (strcmp(type, "Title") == 0) {
-    String metaData = String(value);
+    String metaData = String(value);  // 获取歌曲标题
     int sepIndex = metaData.indexOf(" - ");
     if (sepIndex != -1) {
-      currentArtist = metaData.substring(0, sepIndex);
-      currentSong = metaData.substring(sepIndex + 3);
+      currentArtist = metaData.substring(0, sepIndex);  // 提取歌手
+      currentSong = metaData.substring(sepIndex + 3);   // 提取歌曲
     } else {
       currentArtist = "未知歌手";
       currentSong = metaData;
@@ -107,175 +115,166 @@ void metadataCallback(const char* type, const char* value) {
   }
 }
 
+// 设置函数，初始化硬件和WiFi连接
 void setup() {
-  Serial.begin(115200);
-  configTime(3600, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.begin(115200);                                  // 初始化串口
+  configTime(3600, 0, "pool.ntp.org", "time.nist.gov");  // 配置NTP时间服务器
 
-  rotaryEncoder.begin();
-  rotaryEncoder.setup(readEncoderISR);
-  rotaryEncoder.setBoundaries(0, NUM_STATIONS - 1, true);
+  rotaryEncoder.begin();                                   // 初始化旋转编码器
+  rotaryEncoder.setup(readEncoderISR);                     // 设置中断服务函数
+  rotaryEncoder.setBoundaries(0, NUM_STATIONS - 1, true);  // 设置电台浏览的边界
 
-  u8g2.begin();
-  u8g2.enableUTF8Print();
+  u8g2.begin();            // 初始化显示屏
+  u8g2.enableUTF8Print();  // 启用UTF-8打印支持
 
-  WiFiManager wm;
-  wm.autoConnect("ESP Radio", "");
+  WiFiManager wm;                   // 创建WiFi管理对象
+  wm.autoConnect("ESP Radio", "");  // 自动连接WiFi，默认使用"ESP Radio"作为热点
 
-  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-  preferences.begin("radio", false);
-  currentStation = preferences.getInt("lastStation", 0);
-  audio.setVolume(preferences.getInt("lastVolume", 2));
-  connectToStation(currentStation);
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);           // 设置音频输出引脚
+  preferences.begin("radio", false);                      // 打开偏好设置，读取上次保存的电台和音量
+  currentStation = preferences.getInt("lastStation", 0);  // 获取上次保存的电台
+  audio.setVolume(preferences.getInt("lastVolume", 2));   // 设置上次保存的音量
+  connectToStation(currentStation);                       // 连接到上次保存的电台
 }
 
+// 主循环函数，持续处理音频播放、用户输入和显示更新
 void loop() {
-  audio.loop();
-  handleUserInput();
-  updateDisplay();
+  audio.loop();       // 处理音频播放
+  handleUserInput();  // 处理用户输入（旋转编码器操作）
+  updateDisplay();    // 更新显示
 }
 
+// 用户输入处理函数
 void handleUserInput() {
-  if (rotaryEncoder.encoderChanged()) {
-    lastInteraction = millis();
-    static int lastEncoderValue = rotaryEncoder.readEncoder();
-    int newEncoderValue = rotaryEncoder.readEncoder();
-    int change = newEncoderValue - lastEncoderValue;
+  if (rotaryEncoder.encoderChanged()) {                         // 如果旋转编码器的值发生变化
+    lastInteraction = millis();                                 // 更新上次交互时间
+    static int lastEncoderValue = rotaryEncoder.readEncoder();  // 记录上次的编码器值
+    int newEncoderValue = rotaryEncoder.readEncoder();          // 获取新的编码器值
+    int change = newEncoderValue - lastEncoderValue;            // 计算旋转的变化量
 
-    if (change != 0) {
+    if (change != 0) {  // 如果旋转了
       lastEncoderValue = newEncoderValue;
 
+      // 根据当前模式处理旋转编码器的值
       if (currentMode == PLAY_MODE) {
-        currentMode = TUNE_MODE;
+        currentMode = TUNE_MODE;  // 切换到调谐模式
       } else if (currentMode == TUNE_MODE) {
-        browseIndex += (change > 0 ? 1 : -1);
-
-        // **修改为循环模式**
+        browseIndex += (change > 0 ? 1 : -1);  // 根据旋转方向浏览电台
+        // 循环模式
         if (browseIndex < 0) {
           browseIndex = NUM_STATIONS - 1;
         } else if (browseIndex >= NUM_STATIONS) {
           browseIndex = 0;
         }
       } else if (currentMode == VOLUME_MODE) {
-        int volume = audio.getVolume() + (change > 0 ? 1 : -1);
-        volume = constrain(volume, 0, 21);
-        audio.setVolume(volume);
-        preferences.putInt("lastVolume", volume);
+        int volume = audio.getVolume() + (change > 0 ? 1 : -1);  // 调节音量
+        volume = constrain(volume, 0, 21);                       // 限制音量范围
+        audio.setVolume(volume);                                 // 设置新的音量
+        preferences.putInt("lastVolume", volume);                // 保存音量
       }
     }
   }
 
-  if (rotaryEncoder.isEncoderButtonClicked()) {
-    lastInteraction = millis();
+  if (rotaryEncoder.isEncoderButtonClicked()) {  // 如果按钮被点击
+    lastInteraction = millis();                  // 更新上次交互时间
     if (currentMode == PLAY_MODE) {
-      currentMode = VOLUME_MODE;
+      currentMode = VOLUME_MODE;  // 切换到音量调节模式
     } else if (currentMode == TUNE_MODE) {
-      connectToStation(browseIndex);
-      currentMode = PLAY_MODE;
+      connectToStation(browseIndex);  // 连接到选择的电台
+      currentMode = PLAY_MODE;        // 切换回播放模式
     } else if (currentMode == VOLUME_MODE) {
-      currentMode = PLAY_MODE;
+      currentMode = PLAY_MODE;  // 切换回播放模式
     }
   }
 
+  // 如果长时间没有交互，自动切换回播放模式
   if (millis() - lastInteraction > modeTimeout && currentMode != PLAY_MODE) {
     currentMode = PLAY_MODE;
   }
 }
 
+// 更新显示内容的函数
 void updateDisplay() {
   static int last = 0;
-  if (millis() - last < SHOW_TIME_PERIOD) return;
+  if (millis() - last < SHOW_TIME_PERIOD) return;  // 限制更新频率
   last = millis();
 
-  u8g2.clearBuffer();  // 清屏，防止重叠
+  u8g2.clearBuffer();  // 清屏，防止显示重叠
 
   struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
+  if (getLocalTime(&timeinfo)) {  // 获取当前时间
     char dateStr[32], timeStr[16], volumeStr[8];
     const char* weekDays[] = { "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六" };
     snprintf(dateStr, sizeof(dateStr), "%04d-%02d-%02d %s",
              timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, weekDays[timeinfo.tm_wday]);
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-    snprintf(volumeStr, sizeof(volumeStr), "V: %d", audio.getVolume());
+    snprintf(volumeStr, sizeof(volumeStr), "V: %d", audio.getVolume());  // 获取音量
 
-    u8g2.setFont(u8g2_font_wqy12_t_gb2312b);
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312b);  // 设置中文字体
 
     if (currentMode != TUNE_MODE) {
       u8g2.setCursor(16, 11);
-      u8g2.print(dateStr);
+      u8g2.print(dateStr);  // 显示日期
       u8g2.setCursor(20, 24);
-      u8g2.print(timeStr);
+      u8g2.print(timeStr);  // 显示时间
       u8g2.setCursor(98, 24);
-      u8g2.print(volumeStr);
+      u8g2.print(volumeStr);  // 显示音量
     }
 
-    if (currentMode == PLAY_MODE) {
+    if (currentMode == PLAY_MODE) {  // 在播放模式下显示电台信息和歌曲信息
       u8g2.setCursor(0, 38);
       u8g2.printf("第%d台: %s", currentStation, stations[currentStation].name);
-
       u8g2.setCursor(0, 50);
       u8g2.printf("歌曲: %s", currentSong.c_str());
       u8g2.setCursor(0, 62);
       u8g2.printf("歌手: %s", currentArtist.c_str());
-    } else if (currentMode == TUNE_MODE) {
+    } else if (currentMode == TUNE_MODE) {  // 在调谐模式下显示电台列表
       int startY = 11;
-      int halfWindow = 2;                       // 显示窗口的一半
-      int displayCount = min(5, NUM_STATIONS);  // 确保不会超出可用电台数量
-
+      int halfWindow = 2;
+      int displayCount = min(5, NUM_STATIONS);  // 显示最多5个电台
       for (int i = 0; i < displayCount; i++) {
         int displayIndex = browseIndex - halfWindow + i;
-
-        // 让列表循环滚动而不会在边界处重复
         if (displayIndex < 0) {
           displayIndex += NUM_STATIONS;
         } else if (displayIndex >= NUM_STATIONS) {
           displayIndex -= NUM_STATIONS;
         }
-
         u8g2.setCursor(10, startY + i * 13);
         if (displayIndex == browseIndex) u8g2.print(">> ");
-        u8g2.print(stations[displayIndex].name);
+        u8g2.print(stations[displayIndex].name);  // 显示电台名称
       }
-    } else if (currentMode == VOLUME_MODE) {
+    } else if (currentMode == VOLUME_MODE) {  // 在音量调节模式下显示音量
       u8g2.setCursor(30, 38);
       u8g2.printf("调节音量: %d", audio.getVolume());
     }
 
-    u8g2.sendBuffer();  // 发送数据到屏幕
+    u8g2.sendBuffer();  // 更新显示屏
   }
 }
 
-// 修改后的连接电台函数，调整音量
+// 连接到指定电台并设置音量的函数
 void connectToStation(int stationIndex) {
-  // 获取当前音量
+  // 获取当前音量和增益
   int currentVolume = audio.getVolume();
-
-  // 获取当前电台的增益
   int currentGain = stations[currentStation].gain;
-
-  // 获取新电台的增益
   int newGain = stations[stationIndex].gain;
 
   // 计算新的音量
   int newVolume = currentVolume - currentGain + newGain;
+  newVolume = constrain(newVolume, 0, 21);  // 限制音量范围
 
-  // 限制音量范围（假设最大音量是 21）
-  newVolume = constrain(newVolume, 0, 21);
-
-  // 更新当前电台索引
+  // 更新当前电台索引并保存电台设置
   currentStation = stationIndex;
-
-  // 设置新的音量
   audio.setVolume(newVolume);
-
-  // 保存当前电台和音量
   preferences.putInt("lastStation", stationIndex);
   preferences.putInt("lastVolume", newVolume);
 
-  // 连接到新电台
+  // 连接到新的电台
   audio.connecttohost(stations[stationIndex].url);
 }
 
+// 用于显示电台元数据（如歌曲和歌手信息）
 void audio_showstreamtitle(const char* info) {
   // 假设元数据格式是 "歌手 - 歌曲"
   String metaData = String(info);
