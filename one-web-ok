@@ -1,0 +1,340 @@
+# 包含必要的库文件
+#include "Arduino.h"
+#include "WiFi.h"
+#include "Audio.h"
+#include "AiEsp32RotaryEncoder.h"
+#include <U8g2lib.h>
+#include <SPI.h>
+#include <WiFiManager.h>
+#include <Preferences.h>
+#include <time.h>
+#include <ESPAsyncWebServer.h>
+
+// 常量定义
+#define SHOW_TIME_PERIOD 1000  // 显示更新时间间隔（毫秒）
+#define I2S_DOUT 39            // I2S 数据输出引脚
+#define I2S_BCLK 40            // I2S 时钟引脚
+#define I2S_LRC 41             // I2S 左右声道选择引脚
+#define VOLUME_PIN 5           // 音量调节引脚
+
+// 旋转编码器引脚定义
+#define ROTARY_ENCODER_A_PIN 16
+#define ROTARY_ENCODER_B_PIN 17
+#define ROTARY_ENCODER_BUTTON_PIN 18
+#define ROTARY_ENCODER_STEPS 4  // 旋转编码器步数
+
+// Web 服务端口
+AsyncWebServer server(80);  // 设定 HTTP 服务器监听端口 80
+
+// 定义工作模式
+enum Mode {
+  PLAY_MODE,   // 播放模式
+  TUNE_MODE,   // 调台模式
+  VOLUME_MODE  // 音量调节模式
+};
+Mode currentMode = PLAY_MODE;  // 初始模式设为播放模式
+unsigned long lastInteraction = 0;  // 记录用户最后交互时间
+const unsigned long modeTimeout = 3000;  // 模式超时时间（毫秒）
+
+// 存储配置信息
+Preferences preferences;
+
+// 初始化 U8g2 显示屏
+U8G2_ST7565_LM6059_F_4W_SW_SPI u8g2(U8G2_R0, 11, 10, 14, 12, 13);
+
+// 初始化旋转编码器
+AiEsp32RotaryEncoder rotaryEncoder(ROTARY_ENCODER_A_PIN, ROTARY_ENCODER_B_PIN, ROTARY_ENCODER_BUTTON_PIN, -1, ROTARY_ENCODER_STEPS);
+
+// 初始化音频播放
+Audio audio;
+
+// 定义电台结构体
+struct Station {
+  const char* url;   // 电台流 URL
+  const char* name;  // 电台名称
+  int gain;          // 音量增益值
+};
+
+// 预设电台列表
+Station stations[] = {
+  { "http://icecast.ndr.de/ndr/njoy/live/mp3/128/stream.mp3", "n Joy", 1 },
+  { "http://icecast.ndr.de/ndr/ndr2/niedersachsen/mp3/128/stream.mp3", "NDR 2", 1 },
+  { "https://icecast.ndr.de/ndr/ndr1niedersachsen/oldenburg/mp3/128/stream.mp3", "NDR Niedersachsen", 1 },
+  { "http://stream.ffn.de/ffn/mp3-192/stream.mp3", "FFN", 1 },
+  { "https://lhttp.qtfm.cn/live/1275/64k.mp3", "珠海交通", 1 },
+  { "https://lhttp.qtfm.cn/live/1274/64k.mp3", "珠海先锋", 1 },
+  { "https://live.bjradio.com:8000/bjfm91.mp3", "北京文艺广播", 1 },
+  { "https://www.eastday.com/efm8.m3u", "上海文艺广播", 1 },
+  { "https://live.gzyfm.com:8000/guangzhou_news.mp3", "广州文艺广播", 1 },
+  { "https://www.szrt.com:8000/szrt.m3u", "深圳文艺广播", 1 },
+  { "https://www.chengdufm.com/live/cdfm5.m3u", "成都文艺广播", 1 },
+  { "https://live.bjradio.com:8000/bjfm93.mp3", "书香北京", 1 },
+  { "https://tianjin.radiostream.migu.cn/stream/1034.m3u", "天津文学广播", 1 },
+  { "https://hz1.migu.cn/stream/hunan.fm1.m3u", "湖南文艺广播", 1 },
+  { "https://www.zjradio.com:8000/zzfm.m3u", "浙江文艺广播", 1 },
+  { "https://live.kmradio.com:8000/kmradio.m3u", "云南文艺广播", 1 },
+  { "https://live.bjradio.com:8000/bjfm91.mp3", "北京广播综合频道", 1 },
+  { "https://www.eastday.com/efm8.m3u", "上海东方广播电台", 1 },
+  { "https://live.gzyfm.com:8000/guangzhou_news.mp3", "广州娱乐广播", 1 },
+  { "https://tianjin.radiostream.migu.cn/stream/1034.m3u", "天津广播娱乐频道", 1 },
+  { "https://61.139.93.67:8000/chongqing_traffic.m3u", "重庆娱乐广播", 1 },
+  { "https://hz1.migu.cn/stream/hunan.fm1.m3u", "湖南娱乐广播", 1 },
+  { "https://www.chengdufm.com/live/cdfm5.m3u", "成都娱乐广播", 1 },
+  { "https://live.zzradio.com:8000/zzradio_news.m3u", "郑州娱乐广播", 1 },
+  { "https://www.xafm.cn:8000/xa_music.m3u", "西安娱乐广播", 1 },
+  { "https://61.144.226.186:8000/shenyang_radio.mp3", "沈阳娱乐广播", 1 },
+  { "https://live.bjradio.com:8000/bjfm91.mp3", "北京新闻广播", 1 },
+  { "https://www.eastday.com/efm8.m3u", "上海新闻广播", 1 },
+  { "https://live.gzyfm.com:8000/guangzhou_news.mp3", "广州新闻广播", 1 },
+  { "https://tianjin.radiostream.migu.cn/stream/1034.m3u", "天津广播新闻频道", 1 },
+  { "https://61.139.93.67:8000/chongqing_traffic.m3u", "重庆新闻广播", 1 },
+  { "https://hz1.migu.cn/stream/hunan.fm1.m3u", "湖南新闻广播", 1 },
+  { "https://www.chengdufm.com/live/cdfm5.m3u", "成都新闻广播", 1 },
+  { "https://live.zzradio.com:8000/zzradio_news.m3u", "郑州新闻广播", 1 },
+  { "https://www.xafm.cn:8000/xa_music.m3u", "西安新闻广播", 1 },
+  { "https://61.144.226.186:8000/shenyang_radio.mp3", "沈阳新闻广播", 1 },
+
+};
+
+// 计算电台数量
+int numStations = sizeof(stations) / sizeof(stations[0]);
+
+// 当前电台索引
+int currentStation = 0;
+int browseIndex = 0;
+String currentSong = "未知歌曲";
+String currentArtist = "未知歌手";
+
+// 旋转编码器的中断服务程序
+void IRAM_ATTR readEncoderISR() {
+  rotaryEncoder.readEncoder_ISR();  // 读取旋转编码器状态
+}
+
+// 初始化函数
+void setup() {
+  Serial.begin(115200);  // 初始化串口通讯
+
+  // 设置 NTP 服务器同步时间
+  configTime(3600, 0, "pool.ntp.org", "time.nist.gov");
+
+  // WiFi 连接管理
+  WiFiManager wm;
+  wm.autoConnect("ESP Radio", "");  // 自动连接 WiFi
+
+  // 旋转编码器初始化
+  rotaryEncoder.begin();
+  rotaryEncoder.setup(readEncoderISR);
+  rotaryEncoder.setBoundaries(0, numStations - 1, true);
+
+  // 初始化显示屏
+  u8g2.begin();
+  u8g2.enableUTF8Print();
+
+  // 设置 I2S 音频引脚
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+
+  // 读取上次存储的电台和音量
+  preferences.begin("radio", false);
+  currentStation = preferences.getInt("lastStation", 0);
+  audio.setVolume(preferences.getInt("lastVolume", 2));
+  connectToStation(currentStation);
+
+  // Web 服务处理
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    String html = "<html><body>";
+    html += "<h1>Manage Radio Stations</h1>";
+    html += "<form action='/edit' method='POST'>";
+    html += "<label>Station URL:</label><input type='text' name='url' /><br>";
+    html += "<label>Station Name:</label><input type='text' name='name' /><br>";
+    html += "<label>Gain:</label><input type='number' name='gain' min='0' max='10' /><br>";
+    html += "<input type='submit' value='Add Station' />";
+    html += "</form>";
+    html += "<h2>Current Stations:</h2><ul>";
+
+    for (int i = 0; i < numStations; i++) {
+      html += "<li>" + String(stations[i].name) + " <a href='/delete?index=" + String(i) + "'>Delete</a></li>";
+    }
+
+    html += "</ul></body></html>";
+    request->send(200, "text/html", html);
+  });
+
+  // 添加电台
+  server.on("/edit", HTTP_POST, [](AsyncWebServerRequest* request) {
+    String url = request->arg("url");
+    String name = request->arg("name");
+    String gainStr = request->arg("gain");
+    int gain = gainStr.toInt();
+
+    // 动态添加电台（扩展现有的列表或在实际使用中保存到存储）
+    Station newStation = { url.c_str(), name.c_str(), gain };
+
+    // 添加新的电台到列表
+    if (numStations < sizeof(stations) / sizeof(stations[0])) {
+      stations[numStations] = newStation;
+      numStations++;  // 增加电台数量
+    }
+
+    request->send(200, "text/html", "<html><body><h1>Station Added!</h1><a href='/'>Back</a></body></html>");
+  });
+
+  // 删除电台
+  server.on("/delete", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("index")) {
+      int index = request->getParam("index")->value().toInt();
+      if (index >= 0 && index < numStations) {
+        // 删除指定索引的电台（简单删除）
+        for (int i = index; i < numStations - 1; i++) {
+          stations[i] = stations[i + 1];
+        }
+        numStations--;  // 减少电台数量
+      }
+    }
+    request->send(200, "text/html", "<html><body><h1>Station Deleted!</h1><a href='/'>Back</a></body></html>");
+  });
+
+  server.begin();
+}
+
+// 主循环函数
+void loop() {
+  audio.loop();        // 处理音频播放
+  handleUserInput();   // 处理用户输入
+  updateDisplay();     // 更新显示屏
+}
+
+// 处理用户输入
+void handleUserInput() {
+  if (rotaryEncoder.encoderChanged()) {
+    lastInteraction = millis();  // 记录交互时间
+    static int lastEncoderValue = rotaryEncoder.readEncoder();
+    int newEncoderValue = rotaryEncoder.readEncoder();
+    int change = newEncoderValue - lastEncoderValue;
+
+    if (change != 0) {
+      lastEncoderValue = newEncoderValue;
+
+      if (currentMode == PLAY_MODE) {
+        currentMode = TUNE_MODE;  // 进入调台模式
+      } else if (currentMode == TUNE_MODE) {
+        browseIndex += (change > 0 ? 1 : -1);
+        if (browseIndex < 0) browseIndex = numStations - 1;
+        else if (browseIndex >= numStations) browseIndex = 0;
+      } else if (currentMode == VOLUME_MODE) {
+        int volume = audio.getVolume() + (change > 0 ? 1 : -1);
+        volume = constrain(volume, 0, 21);
+        audio.setVolume(volume);
+        preferences.putInt("lastVolume", volume);
+      }
+    }
+  }
+}
+
+  if (rotaryEncoder.isEncoderButtonClicked()) {
+    lastInteraction = millis();
+    if (currentMode == PLAY_MODE) {
+      currentMode = VOLUME_MODE;
+    } else if (currentMode == TUNE_MODE) {
+      connectToStation(browseIndex);
+      currentMode = PLAY_MODE;
+    } else if (currentMode == VOLUME_MODE) {
+      currentMode = PLAY_MODE;
+    }
+  }
+
+  if (millis() - lastInteraction > modeTimeout && currentMode != PLAY_MODE) {
+    currentMode = PLAY_MODE;
+  }
+}
+
+// 更新显示
+void updateDisplay() {
+  static int last = 0;
+  if (millis() - last < SHOW_TIME_PERIOD) return;
+  last = millis();
+
+  u8g2.clearBuffer();
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char dateStr[32], timeStr[16], volumeStr[8];
+    const char* weekDays[] = { "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六" };
+    snprintf(dateStr, sizeof(dateStr), "%04d-%02d-%02d %s",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, weekDays[timeinfo.tm_wday]);
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    snprintf(volumeStr, sizeof(volumeStr), "V: %d", audio.getVolume());
+
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312b);
+
+    if (currentMode != TUNE_MODE) {
+      u8g2.setCursor(16, 11);
+      u8g2.print(dateStr);
+      u8g2.setCursor(20, 24);
+      u8g2.print(timeStr);
+      u8g2.setCursor(98, 24);
+      u8g2.print(volumeStr);
+    }
+
+    if (currentMode == PLAY_MODE) {
+      u8g2.setCursor(0, 38);
+      u8g2.printf("第%d台: %s", currentStation, stations[currentStation].name);
+      u8g2.setCursor(0, 50);
+      u8g2.printf("歌曲: %s", currentSong.c_str());
+      u8g2.setCursor(0, 62);
+      u8g2.printf("歌手: %s", currentArtist.c_str());
+    } else if (currentMode == TUNE_MODE) {
+      int startY = 11;
+      int halfWindow = 2;
+      int displayCount = min(5, numStations);
+      for (int i = 0; i < displayCount; i++) {
+        int displayIndex = browseIndex - halfWindow + i;
+        if (displayIndex < 0) {
+          displayIndex += numStations;
+        } else if (displayIndex >= numStations) {
+          displayIndex -= numStations;
+        }
+        u8g2.setCursor(10, startY + i * 13);
+        if (displayIndex == browseIndex) u8g2.print(">> ");
+        u8g2.print(stations[displayIndex].name);
+      }
+    } else if (currentMode == VOLUME_MODE) {
+      u8g2.setCursor(30, 38);
+      u8g2.printf("调节音量: %d", audio.getVolume());
+      String ipAddress = WiFi.localIP().toString();
+      u8g2.setCursor(30, 62);
+      u8g2.print("IP: ");
+    }
+
+    u8g2.sendBuffer();
+  }
+}
+
+// 连接到指定电台
+void connectToStation(int stationIndex) {
+  int currentVolume = audio.getVolume();
+  int currentGain = stations[currentStation].gain;
+  int newGain = stations[stationIndex].gain;
+
+  int newVolume = currentVolume - currentGain + newGain;
+  newVolume = constrain(newVolume, 0, 21);
+
+  currentStation = stationIndex;
+  audio.setVolume(newVolume);
+  preferences.putInt("lastStation", stationIndex);
+  preferences.putInt("lastVolume", newVolume);
+  audio.connecttohost(stations[stationIndex].url);
+}
+
+
+// 用于显示电台元数据（如歌曲和歌手信息）
+void audio_showstreamtitle(const char* info) {
+  // 假设元数据格式是 "歌手 - 歌曲"
+  String metaData = String(info);
+  int sepIndex = metaData.indexOf(" - ");
+  if (sepIndex != -1) {
+    currentArtist = metaData.substring(0, sepIndex);  // 提取歌手
+    currentSong = metaData.substring(sepIndex + 3);   // 提取歌曲
+  } else {
+    currentArtist = "未知歌手";
+    currentSong = metaData;
+  }
+}
