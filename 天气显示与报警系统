@@ -1,0 +1,272 @@
+/*
+ * 项目名称: 天气显示与报警系统
+ * 更新日期: 2025年2月26日
+ * 描述: 本程序用于ESP8266，通过WiFi获取天气数据并显示在ST7920 128x64屏幕上，
+ *       支持时间同步、LED指示和烟雾报警功能。已移除DHT传感器相关功能。
+ * 
+ * 使用的库清单（名称、作者、版本）：
+ * 1. ESP8266WiFi.h - Espressif Systems - 3.x.x
+ * 2. JsonListener.h - 不明确 - 1.x.x
+ * 3. stdio.h - C标准库 - 无版本
+ * 4. time.h - C标准库 - 无版本
+ * 5. coredecls.h - Espressif Systems - 3.x.x
+ * 6. Timezone.h - Jack Christensen - 1.2.x
+ * 7. Arduino.h - Arduino Team - 3.x.x
+ * 8. U8g2lib.h - olikraus - 2.35.x
+ * 9. SPI.h - Arduino Team - 3.x.x
+ * 10. WiFiManager.h - tzapu - 2.x.x
+ * 11. HeWeatherCurrent.h - 不明确 - 随项目
+ * 12. HeWeatherForecast.h - 不明确 - 随项目
+ * 13. GarfieldCommon.h - 不明确 - 随项目
+ */
+
+#include <ESP8266WiFi.h>
+#include <JsonListener.h>
+#include <stdio.h>
+#include <time.h>
+#include <coredecls.h>
+#include <Timezone.h>
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include <SPI.h>
+#include <WiFiManager.h>
+#include "HeWeatherCurrent.h"
+#include "HeWeatherForecast.h"
+#include "GarfieldCommon.h"
+
+// 配置定义
+#define CURRENT_VERSION 6
+#define DEBUG
+#define LANGUAGE_CN          // 仅支持中文，移除英文选项以精简
+#define USE_HIGH_ALARM       // 默认高电平报警
+#define USE_LED              // 默认启用LED
+#define SMOKEPIN 2           // 烟雾引脚
+#define ALARMPIN 5           // 报警引脚
+#define LEDRED 15            // 红色LED
+#define LEDGREEN 0           // 绿色LED
+
+// 常量定义
+const String HEWEATHER_LANGUAGE = "zh";       // 和风天气语言
+const String HEWEATHER_LOCATION = "auto_ip";  // 自动位置
+const String WDAY_NAMES[] = { "星期天", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六" };
+const String DEGREE = String((char)176);      // 度数符号
+const uint32_t PAGE_UPDATE_INTERVAL = 3000;   // 页面更新间隔（毫秒）
+const uint32_t SMOKE_DISABLE_PERIOD = 120000; // 烟雾禁用时间（毫秒）
+const uint32_t SMOKE_DEBOUNCE_TIME = 10000;   // 烟雾消抖时间（毫秒）
+const uint32_t UPDATE_INTERVAL_SECS = 3600;   // 天气更新间隔（秒）
+
+// 全局变量
+int displayContrast = 128;                    // 显示对比度
+bool dummyMode = false;                       // 虚拟模式
+bool readyForWeatherUpdate = false;           // 天气更新标志
+uint32_t timeSinceLastWUpdate = 0;            // 上次天气更新时间
+uint32_t timeSinceLastPageUpdate = 0;         // 上次页面更新时间
+uint32_t timeSinceSystemBoot = 0;             // 系统启动时间
+uint32_t smokeLastDebounce = 0;               // 上次烟雾消抖时间
+uint8_t draw_state = 0;                       // 显示状态
+volatile bool smokeSendEmail = false;         // 烟雾报警标志
+int previousSmokeValue = 0;                   // 上次烟雾值
+
+// 对象定义
+HeWeatherCurrentData currentWeather;          // 当前天气
+HeWeatherCurrent currentWeatherClient;        // 当前天气客户端
+HeWeatherForecastData forecasts[MAX_FORECASTS]; // 天气预报
+HeWeatherForecast forecastClient;             // 预报客户端
+U8G2_ST7920_128X64_F_SW_SPI display(U8G2_R0, 14, 12, 13, U8X8_PIN_NONE); // 显示屏
+
+// 函数声明
+void smokeHandler();
+void ledoff();
+void ledred();
+void ledgreen();
+void ledyellow();
+void updateData(bool initial);
+void drawLocal();
+
+// 烟雾中断处理
+void ICACHE_RAM_ATTR smokeHandler() {
+  int smokeValue = digitalRead(SMOKEPIN);
+#ifdef DEBUG
+  Serial.print("烟雾中断: ");
+  Serial.println(smokeValue);
+#endif
+  smokeSendEmail = true;
+  digitalWrite(ALARMPIN, smokeValue ? LOW : HIGH); // 高电平报警
+  smokeValue ? ledoff() : ledred();                // LED状态
+}
+
+// LED控制函数
+void ledoff() {
+  digitalWrite(LEDGREEN, LOW);
+  digitalWrite(LEDRED, LOW);
+}
+
+void ledred() {
+  ledoff();
+  analogWrite(LEDRED, 100); // 新型LED亮度
+}
+
+void ledgreen() {
+  ledoff();
+  analogWrite(LEDGREEN, 100);
+}
+
+void ledyellow() {
+  ledoff();
+  analogWrite(LEDRED, 50);
+  analogWrite(LEDGREEN, 100);
+}
+
+// 初始化
+void setup() {
+  delay(100);
+#ifdef DEBUG
+  Serial.begin(115200);
+  Serial.println("开始初始化");
+#endif
+
+  // 初始化引脚
+  pinMode(SMOKEPIN, INPUT);
+  pinMode(ALARMPIN, OUTPUT);
+  digitalWrite(ALARMPIN, LOW); // 默认关闭报警
+  pinMode(LEDRED, OUTPUT);
+  pinMode(LEDGREEN, OUTPUT);
+
+  // LED测试
+  ledred(); delay(500);
+  ledgreen(); delay(500);
+  ledyellow(); delay(500);
+  ledoff();
+
+  // 初始化显示屏
+  display.begin();
+  display.setFontPosTop();
+  display.clearBuffer();
+  display.drawXBM(31, 0, 66, 64, garfield); // 显示Garfield图案
+  display.sendBuffer();
+  delay(1000);
+
+  // 显示启动信息
+  display.clearBuffer();
+  display.enableUTF8Print();
+  display.setFont(u8g2_font_wqy12_t_gb2312);
+  display.setCursor(20, 13);
+  display.print("连接WIFI: IBECloc12864-HW");
+  display.sendBuffer();
+
+  // 连接WiFi
+  WiFiManager wifiManager;
+  wifiManager.autoConnect("IBECloc12864-HW");
+  if (WiFi.status() != WL_CONNECTED) ESP.restart();
+
+  // 初始化时间和天气
+  configTime(8 * 3600, 0, "pool.ntp.org"); // 中国时区UTC+8
+  updateData(true);
+  timeSinceLastWUpdate = millis();
+  timeSinceSystemBoot = millis();
+  previousSmokeValue = digitalRead(SMOKEPIN);
+  attachInterrupt(digitalPinToInterrupt(SMOKEPIN), smokeHandler, CHANGE);
+}
+
+// 主循环
+void loop() {
+  // 烟雾检测
+  time_t now = time(nullptr);
+  struct tm* timeInfo = localtime(&now);
+  if (timeInfo->tm_year > 99 && (millis() - timeSinceSystemBoot) > SMOKE_DISABLE_PERIOD) {
+    if (smokeSendEmail && (millis() - smokeLastDebounce) > SMOKE_DEBOUNCE_TIME) {
+      smokeLastDebounce = millis();
+      int smokeValue = digitalRead(SMOKEPIN);
+      if (smokeValue != previousSmokeValue) {
+        previousSmokeValue = smokeValue;
+        smokeSendEmail = false;
+      }
+    }
+  }
+
+  // 显示更新
+  display.firstPage();
+  do {
+    drawLocal(); // 默认只显示本地天气
+  } while (display.nextPage());
+
+  // 页面切换
+  if (millis() - timeSinceLastPageUpdate > PAGE_UPDATE_INTERVAL) {
+    timeSinceLastPageUpdate = millis();
+    draw_state = (draw_state + 1) % 6; // 简化至6个状态
+  }
+
+  // 天气更新
+  if (millis() - timeSinceLastWUpdate > (1000 * UPDATE_INTERVAL_SECS)) {
+    readyForWeatherUpdate = true;
+    timeSinceLastWUpdate = millis();
+  }
+  if (readyForWeatherUpdate) updateData(false);
+}
+
+// 绘制本地天气
+void drawLocal() {
+  time_t now = time(nullptr);
+  struct tm* timeInfo = localtime(&now);
+  char buff[10];
+
+  display.enableUTF8Print();
+  display.setFont(u8g2_font_wqy12_t_gb2312);
+  String date = String(timeInfo->tm_year + 1900) + "年" + (timeInfo->tm_mon + 1) + "月" + timeInfo->tm_mday + "日 " + WDAY_NAMES[timeInfo->tm_wday];
+  int width = display.getUTF8Width(date.c_str());
+  display.setCursor((128 - width) / 2, 1);
+  display.print(date);
+
+  width = display.getUTF8Width(currentWeather.cond_txt.c_str());
+  display.setCursor((128 - width) / 2, 40);
+  display.print(currentWeather.cond_txt);
+
+  String wind = windDirectionTranslate(currentWeather.wind_dir) + currentWeather.wind_sc + "级";
+  width = display.getUTF8Width(wind.c_str());
+  display.setCursor((128 - width) / 2, 54);
+  display.print(wind);
+  display.disableUTF8Print();
+
+  // 时间和温度显示
+  display.setFont(u8g2_font_helvR24_tn);
+  sprintf(buff, "%02d:%02d", timeInfo->tm_hour, timeInfo->tm_min);
+  width = display.getStrWidth(buff);
+  display.drawStr((128 - 30 - width) / 2, 11, buff);
+
+  display.setFont(Meteocon21);
+  display.drawStr(98, 17, currentWeather.iconMeteoCon.substring(0, 1).c_str());
+
+  display.setFont(u8g2_font_helvR08_tf);
+  String temp = currentWeather.tmp + DEGREE + "C";
+  display.drawStr(0, 53, temp.c_str());
+
+  width = display.getStrWidth((currentWeather.hum + "%").c_str());
+  display.drawStr(127 - width, 53, (currentWeather.hum + "%").c_str());
+  display.drawHLine(0, 51, 128);
+
+  // LED根据天气调整
+  String cond = currentWeather.cond_txt;
+  if (cond.indexOf("暴") >= 0 || cond.indexOf("雾") >= 0) ledred();
+  else if (cond.indexOf("雨") >= 0 || cond.indexOf("雪") >= 0) ledyellow();
+  else ledgreen();
+}
+
+// 更新天气数据
+void updateData(bool initial) {
+  if (initial) {
+    display.clearBuffer();
+    display.enableUTF8Print();
+    display.setFont(u8g2_font_wqy12_t_gb2312);
+    display.setCursor(20, 13);
+    display.print("正在更新本地天气...");
+    display.sendBuffer();
+  }
+  currentWeatherClient.updateCurrent(&currentWeather, HEWEATHER_APP_ID, HEWEATHER_LOCATION, HEWEATHER_LANGUAGE);
+  
+  time_t now = time(nullptr);
+  struct tm* timeInfo = localtime(&now);
+  if (initial || timeInfo->tm_hour == 0 || timeInfo->tm_hour == 8 || timeInfo->tm_hour == 11 || timeInfo->tm_hour == 18) {
+    forecastClient.updateForecast(forecasts, HEWEATHER_APP_ID, HEWEATHER_LOCATION, HEWEATHER_LANGUAGE);
+  }
+  readyForWeatherUpdate = false;
+}
